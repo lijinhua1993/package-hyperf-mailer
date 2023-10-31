@@ -1,0 +1,232 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Lijinhua\HyperfMailer;
+
+use Hyperf\Collection\Arr;
+use Hyperf\Contract\ConfigInterface;
+use Hyperf\Logger\LoggerFactory;
+use Hyperf\Stringable\Str;
+use Lijinhua\HyperfMailer\Concern\PendingMailable;
+use Lijinhua\HyperfMailer\Contract\MailableInterface;
+use Lijinhua\HyperfMailer\Contract\MailerInterface;
+use Lijinhua\HyperfMailer\Contract\MailManagerInterface;
+use Lijinhua\HyperfMailer\Contract\ShouldQueue;
+use Psr\Container\ContainerInterface;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\Mailer\Mailer as SymfonyMailer;
+use Symfony\Component\Mailer\Transport;
+use Symfony\Component\Mailer\Transport\Dsn;
+use Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport;
+use Symfony\Component\Mailer\Transport\Smtp\EsmtpTransportFactory;
+use Symfony\Component\Mailer\Transport\Smtp\Stream\SocketStream;
+use Symfony\Component\Mailer\Transport\TransportInterface;
+
+/**
+ * @mixin Mailer
+ */
+class MailManager implements MailManagerInterface
+{
+    use PendingMailable;
+
+    /**
+     * The config instance.
+     */
+    protected ConfigInterface $config;
+
+    /**
+     * The array of resolved mailers.
+     *
+     * @var Mailer[]
+     */
+    protected array $mailers = [];
+
+    /**
+     * Create a new Mail manager instance.
+     */
+    public function __construct(protected ContainerInterface $container)
+    {
+        $this->config = $container->get(ConfigInterface::class);
+    }
+
+    /**
+     * Dynamically call the default driver instance.
+     *
+     * @return mixed
+     */
+    public function __call(string $method, array $arguments)
+    {
+        return $this->mailer()->{$method}(...$arguments);
+    }
+
+    /**
+     * Get a mailer instance by name.
+     */
+    public function mailer(?string $name = null): MailerInterface
+    {
+        $name = $name ?: $this->getDefaultMailerName();
+
+        return $this->get($name);
+    }
+
+    /**
+     * Get a mailer instance by name.
+     */
+    public function get(string $name): MailerInterface
+    {
+        if (empty($this->mailers[$name])) {
+            $this->mailers[$name] = $this->resolve($name);
+        }
+
+        return $this->mailers[$name];
+    }
+
+    /**
+     * Send the given mailable.
+     */
+    public function send(MailableInterface $mailable): void
+    {
+        $mailable instanceof ShouldQueue
+            ? $mailable->queue()
+            : $mailable->send($this);
+    }
+
+    /**
+     * Create a new transport instance.
+     */
+    protected function createTransport(array $config): TransportInterface
+    {
+        $logger = null;
+        if (($loggerConfig = $this->config->get('mail.logger')) && $loggerConfig['enabled'] === true) {
+            $logger = $this->container->get(LoggerFactory::class)->get(
+                $loggerConfig['name'] ?? 'mail',
+                $loggerConfig['group'] ?? 'default'
+            );
+        }
+
+        if (!empty($config['transport'])) {
+            if ($config['transport'] == 'smtp') {
+                return $this->createSmtpTransport($config['options'], $logger);
+            }
+            return \Hyperf\Support\make($config['transport'], ['options' => $config['options'] ?? []]);
+        }
+
+        if (empty($config['dsn'])) {
+            throw new \InvalidArgumentException('The mail transport DSN must be specified.');
+        }
+
+        return Transport::fromDsn($config['dsn'], null, null, $logger);
+    }
+
+    /**
+     * Create an instance of the Symfony SMTP Transport driver.
+     *
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport
+     */
+    protected function createSmtpTransport(array $config, LoggerInterface $logger = null)
+    {
+        $factory = new EsmtpTransportFactory(logger: $logger);
+
+        $transport = $factory->create(new Dsn(
+            !empty($config['encryption']) && $config['encryption'] === 'tls' ? (($config['port'] == 465) ? 'smtps' : 'smtp') : '',
+            $config['host'],
+            $config['username'] ?? null,
+            $config['password'] ?? null,
+            isset($config['port']) ? (int) $config['port'] : null,
+            $config
+        ));
+
+        return $this->configureSmtpTransport($transport, $config);
+    }
+
+    /**
+     * Configure the additional SMTP driver options.
+     *
+     * @param  \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport  $transport
+     * @param  array  $config
+     * @return \Symfony\Component\Mailer\Transport\Smtp\EsmtpTransport
+     */
+    protected function configureSmtpTransport(EsmtpTransport $transport, array $config)
+    {
+        $stream = $transport->getStream();
+
+        if ($stream instanceof SocketStream) {
+            if (isset($config['source_ip'])) {
+                $stream->setSourceIp($config['source_ip']);
+            }
+
+            if (isset($config['timeout'])) {
+                $stream->setTimeout($config['timeout']);
+            }
+        }
+
+        return $transport;
+    }
+
+    /**
+     * Get the default mail driver name.
+     */
+    protected function getDefaultMailerName(): string
+    {
+        return $this->config->get('mail.default');
+    }
+
+    /**
+     * Resolve the given mailer.
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function resolve(string $name): Mailer
+    {
+        $config = $this->getConfig($name);
+
+        if (is_null($config)) {
+            throw new \InvalidArgumentException("Mailer [{$name}] is not defined.");
+        }
+
+        // Once we have created the mailer instance we will set a container instance
+        // on the mailer. This allows us to resolve mailer classes via containers
+        // for maximum testability on said classes instead of passing Closures.
+        $symfonyMailer = $this->createSymfonyMailer($config);
+        $mailer        = \Hyperf\Support\make(Mailer::class, ['name' => $name, 'mailer' => $symfonyMailer]);
+
+        // Next we will set all of the global addresses on this mailer, which allows
+        // for easy unification of all "from" addresses as well as easy debugging
+        // of sent messages since these will be sent to a single email address.
+        foreach (['from', 'reply_to', 'to', 'return_path'] as $type) {
+            $this->setGlobalAddress($mailer, $config, $type);
+        }
+
+        return $mailer;
+    }
+
+    /**
+     * Create the Symfony Mailer instance for the given configuration.
+     */
+    protected function createSymfonyMailer(array $config): SymfonyMailer
+    {
+        return new SymfonyMailer($this->createTransport($config));
+    }
+
+    /**
+     * Set a global address on the mailer by type.
+     */
+    protected function setGlobalAddress(MailerInterface $mailer, array $config, string $type)
+    {
+        $address = Arr::get($config, $type, $this->config->get('mail.' . $type));
+
+        if (is_array($address) && isset($address['address'])) {
+            $mailer->{'setAlways' . Str::studly($type)}($address['address'], $address['name']);
+        }
+    }
+
+    /**
+     * Get the mail connection configuration.
+     */
+    protected function getConfig(string $name): array
+    {
+        return $this->config->get("mail.mailers.{$name}");
+    }
+}
